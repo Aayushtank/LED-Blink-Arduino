@@ -1,82 +1,307 @@
-/**
- * Project      : LED Blinker (Non-Blocking)
- * Description  : Professional embedded example demonstrating non-blocking LED
- *                toggling using millis(), suitable for scalable systems.
- * Board        : Arduino UNO / Nano / Mega
- * Author       : <Your Name>
- * Date         : <DD-MM-YYYY>
- */
+/********************************************************************************
+ * Temperature_Controlled_Fan.ino
+ *
+ * Real-life embedded example: automatic fan control based on temperature.
+ * Supports DHT sensors (DHT11/DHT22) or LM35 analog temperature sensor.
+ *
+ * Features:
+ *  - Non-blocking sensor read using millis()
+ *  - Hysteresis to prevent chatter
+ *  - Proportional PWM control for fan speed above threshold
+ *  - Serial menu to read/set temperature threshold at runtime
+ *
+ * Author : <Your Name>
+ * Date   : <DD-MM-YYYY>
+ *
+ * Hardware:
+ *  - Arduino UNO / Nano / Mega
+ *  - DHT11/DHT22 sensor (digital)  or  LM35 (analog)
+ *  - Fan driven by PWM-capable MOSFET / motor driver (do NOT drive a fan directly from Arduino pin)
+ *  - Power supply appropriate for the fan
+ *
+ * Wiring (example):
+ *  - FAN_PWM_PIN -> Gate of MOSFET (through small resistor). MOSFET source -> GND, drain -> fan negative.
+ *  - Fan positive -> external 5V/12V supply (common GND with Arduino).
+ *  - LM35 -> A0 (if using LM35)
+ *  - DHT -> D2 (if using DHT)
+ *
+ * IMPORTANT: Use a proper transistor / MOSFET or driver and flyback diode (if fan is inductive)
+ ********************************************************************************/
 
- // -------------------------------
- // User Configuration Section
- // -------------------------------
+/* -------------------- Configuration -------------------- */
+// Select sensor: set to true to use DHT (digital) OR false to use LM35 (analog)
+#define USE_DHT true
 
-const uint8_t LED_PIN = 13;          // Built-in LED pin
-unsigned long ON_TIME  = 500;        // LED ON duration (ms)
-unsigned long OFF_TIME = 500;        // LED OFF duration (ms)
+// If using DHT:
+#if USE_DHT
+  #include <DHT.h>           // Install "DHT sensor library" by Adafruit via Library Manager
+  #define DHT_PIN 2         // Digital pin connected to DHT data
+  #define DHT_TYPE DHT22    // DHT11 or DHT22 (change if using DHT11)
+  DHT dht(DHT_PIN, DHT_TYPE);
+#else
+  // If using LM35:
+  #define LM35_PIN A0       // Analog pin for LM35 output
+#endif
 
+// Fan PWM pin (must support PWM)
+const uint8_t FAN_PWM_PIN = 9;
 
-// -------------------------------
-// Internal Variables
-// -------------------------------
+// Temperature control parameters (degrees Celsius)
+float tempThreshold = 30.0;    // turn fan ON above this temperature
+const float hysteresis = 1.5;  // degrees to prevent frequent toggles
 
-bool ledState = LOW;                 // Current LED state
-unsigned long previousMillis = 0;    // Last toggle timestamp
+// Fan control mapping
+const float controlSpan = 10.0; // range above threshold where fan ramps from 0 -> 100%
 
+// Timing
+const unsigned long SENSOR_READ_INTERVAL = 2000UL; // ms between sensor reads
+const unsigned long SERIAL_POLL_INTERVAL = 200UL;  // ms between serial polls
 
-// -------------------------------
-// Setup Function
-// -------------------------------
+/* -------------------- Internal State -------------------- */
+unsigned long lastSensorMillis = 0;
+unsigned long lastSerialMillis = 0;
+float currentTemp = NAN;
+bool fanEnabled = false;  // whether fan is currently ON (non-zero PWM)
+unsigned long startMillis = 0;
 
+/* -------------------- Prototypes -------------------- */
+void initHardware();
+void readSensorNonBlocking();
+float readTemperature(); // returns temperature in Celsius, NAN on error
+void updateFanControl(float temperature);
+void applyFanPWM(uint8_t pwmValue);
+void handleSerialCommandsNonBlocking();
+void printStatus();
+void printHelp();
+
+/* -------------------- Setup -------------------- */
 void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, ledState);
-
+  startMillis = millis();
   Serial.begin(9600);
-  Serial.println("=== LED Blinker Started (Non-Blocking Mode) ===");
-  Serial.println("LED toggles WITHOUT using delay() for better performance.");
+  while (!Serial) { /* wait for serial on some boards */ }
+
+  initHardware();
+
+  Serial.println();
+  Serial.println(F("=== Temperature Controlled Fan System ==="));
+  Serial.print(F("Sensor mode: "));
+  #if USE_DHT
+    Serial.println(F("DHT (digital)"));
+  #else
+    Serial.println(F("LM35 (analog)"));
+  #endif
+  Serial.print(F("Initial threshold: "));
+  Serial.print(tempThreshold);
+  Serial.println(F(" °C"));
+  printHelp();
 }
 
+/* -------------------- Main Loop -------------------- */
+void loop() {
+  unsigned long now = millis();
 
-// -------------------------------
-// LED Update Function (Non-Blocking)
-// -------------------------------
+  // Sensor read (non-blocking)
+  if (now - lastSensorMillis >= SENSOR_READ_INTERVAL) {
+    lastSensorMillis = now;
+    readSensorNonBlocking(); // updates currentTemp
+    if (!isnan(currentTemp)) {
+      updateFanControl(currentTemp);
+      printStatus();
+    } else {
+      Serial.println(F("[WARN] Sensor read failed."));
+    }
+  }
 
-void updateLED() {
-  unsigned long currentMillis = millis();
+  // Serial handling (non-blocking)
+  if (now - lastSerialMillis >= SERIAL_POLL_INTERVAL) {
+    lastSerialMillis = now;
+    handleSerialCommandsNonBlocking();
+  }
 
-  // Determine interval based on LED state
-  unsigned long interval = (ledState == HIGH) ? ON_TIME : OFF_TIME;
+  // Main loop remains free for other tasks
+}
 
-  // Toggle LED when interval passes
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
+/* -------------------- Functions -------------------- */
 
-    // Toggle state
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState);
+void initHardware() {
+  pinMode(FAN_PWM_PIN, OUTPUT);
+  applyFanPWM(0); // ensure fan is off at start
 
-    // Debug output
-    Serial.print("LED State: ");
-    Serial.println(ledState ? "ON" : "OFF");
+  #if USE_DHT
+    dht.begin();
+  #endif
+}
+
+void readSensorNonBlocking() {
+  float t = readTemperature();
+  if (!isnan(t)) {
+    currentTemp = t;
   }
 }
 
+float readTemperature() {
+  #if USE_DHT
+    // DHT reading - DHT.readTemperature returns Celsius 
+    float t = dht.readTemperature();
+    if (isnan(t)) {
+      // try again once (some DHTs are flaky)
+      delay(50); // very short blocking retry
+      t = dht.readTemperature();
+    }
+    return t; // may be NAN
+  #else
+    // LM35: outputs 10 mV per °C. ADC reference = 5V, 10-bit ADC
+    int raw = analogRead(LM35_PIN);
+    // Convert ADC reading to voltage
+    float voltage = raw * (5.0 / 1023.0); // V
+    // LM35 outputs 10 mV per °C -> temp = voltage * 100
+    float tempC = voltage * 100.0;
+    return tempC;
+  #endif
+}
 
-// -------------------------------
-// Main Loop
-// -------------------------------
+void updateFanControl(float temperature) {
+  static bool lastFanOn = false;
 
-void loop() {
-  updateLED();   // Blinks LED without blocking CPU
+  // Determine target (on/off) using hysteresis
+  if (!fanEnabled) {
+    // currently off; check if we should turn on
+    if (temperature >= tempThreshold) {
+      fanEnabled = true;
+    }
+  } else {
+    // currently on; keep it on until below (threshold - hysteresis)
+    if (temperature <= (tempThreshold - hysteresis)) {
+      fanEnabled = false;
+    }
+  }
 
-  /*
-    CPU remains free for future expansions:
-    - Sensor reading
-    - Serial menu system
-    - Communication modules (I2C, SPI, UART)
-    - RTOS integration
+  // If fanEnabled false -> ensure 0 PWM
+  if (!fanEnabled) {
+    applyFanPWM(0);
+  } else {
+    // Compute proportional PWM:
+    // Map temperature from [tempThreshold .. tempThreshold+controlSpan] -> [0 .. 255]
+    float over = temperature - tempThreshold;
+    if (over <= 0.0) {
+      applyFanPWM(0);
+    } else {
+      float ratio = over / controlSpan;
+      if (ratio > 1.0) ratio = 1.0;
+      uint8_t pwm = (uint8_t)(ratio * 255.0);
+      // small minimum to ensure fan spins on some motors
+      const uint8_t PWM_MIN = 60;
+      if (pwm < PWM_MIN && pwm > 0) pwm = PWM_MIN;
+      applyFanPWM(pwm);
+    }
+  }
 
-    This is the recommended structure for real embedded applications.
-  */
+  // Optionally, log state transitions
+  if (fanEnabled != lastFanOn) {
+    Serial.print(F("[STATE] Fan "));
+    Serial.println(fanEnabled ? F("ENABLED") : F("DISABLED"));
+    lastFanOn = fanEnabled;
+  }
+}
+
+void applyFanPWM(uint8_t pwmValue) {
+  analogWrite(FAN_PWM_PIN, pwmValue);
+}
+
+/* -------------------- Serial / CLI -------------------- */
+
+void handleSerialCommandsNonBlocking() {
+  if (Serial.available() == 0) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+
+  // Commands:
+  //  h          -> help
+  //  p          -> print status
+  //  t          -> print threshold
+  //  s<value>   -> set threshold, e.g., s28.5
+  //  m          -> print mode (DHT/LM35)
+  //  r          -> reset (not hardware reset, just restart logs)
+  char cmd = line.charAt(0);
+
+  switch (cmd) {
+    case 'h':
+    case 'H':
+      printHelp();
+      break;
+    case 'p':
+    case 'P':
+      printStatus();
+      break;
+    case 't':
+    case 'T':
+      Serial.print(F("Current threshold: "));
+      Serial.print(tempThreshold);
+      Serial.println(F(" °C"));
+      break;
+    case 's':
+    case 'S': {
+      String valStr = line.substring(1);
+      valStr.trim();
+      if (valStr.length() == 0) {
+        Serial.println(F("[ERROR] No value provided. Use s<value>, e.g., s28.5"));
+      } else {
+        float v = valStr.toFloat();
+        if (v == 0 && valStr != "0" && valStr != "0.0") {
+          Serial.println(F("[ERROR] Invalid number."));
+        } else {
+          tempThreshold = v;
+          Serial.print(F("[INFO] Threshold set to "));
+          Serial.print(tempThreshold);
+          Serial.println(F(" °C"));
+        }
+      }
+      break;
+    }
+    case 'm':
+    case 'M':
+      #if USE_DHT
+        Serial.println(F("Mode: DHT sensor"));
+      #else
+        Serial.println(F("Mode: LM35 sensor"));
+      #endif
+      break;
+    case 'r':
+    case 'R':
+      Serial.println(F("[INFO] Restarting logs..."));
+      break;
+    default:
+      Serial.print(F("[ERROR] Unknown command: "));
+      Serial.println(line);
+      printHelp();
+      break;
+  }
+}
+
+void printStatus() {
+  Serial.print(F("[STATUS] Time(ms): "));
+  Serial.print(millis() - startMillis);
+  Serial.print(F(" | Temp: "));
+  if (isnan(currentTemp)) {
+    Serial.print(F("NAN"));
+  } else {
+    Serial.print(currentTemp, 2);
+    Serial.print(F(" °C"));
+  }
+  Serial.print(F(" | Threshold: "));
+  Serial.print(tempThreshold, 2);
+  Serial.print(F(" °C"));
+  Serial.print(F(" | Fan: "));
+  Serial.println(fanEnabled ? F("ON") : F("OFF"));
+}
+
+void printHelp() {
+  Serial.println(F("Commands:"));
+  Serial.println(F("  h         -> help"));
+  Serial.println(F("  p         -> print status"));
+  Serial.println(F("  t         -> print threshold"));
+  Serial.println(F("  s<V>      -> set threshold to V (e.g., s28.5)"));
+  Serial.println(F("  m         -> print sensor mode"));
+  Serial.println();
 }
