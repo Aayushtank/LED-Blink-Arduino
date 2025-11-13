@@ -1,8 +1,6 @@
 Temperature Controlled Fan – Arduino-based Real-Life Embedded Project
 A. GitHub Repository Link
-
-(Add your link after creating the repo)
-Repository: https://github.com/your-username/Temperature-Controlled-Fan
+https://github.com/Aayushtank/LED-Blink-Arduino/edit/main/
 
 B. Project Overview
 
