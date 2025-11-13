@@ -10,8 +10,8 @@
  *  - Proportional PWM control for fan speed above threshold
  *  - Serial menu to read/set temperature threshold at runtime
  *
- * Author : <Your Name>
- * Date   : <DD-MM-YYYY>
+ * Author : Aayush
+ * Date   : 13/ 11/ 2025
  *
  * Hardware:
  *  - Arduino UNO / Nano / Mega
